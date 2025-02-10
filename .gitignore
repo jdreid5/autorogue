@@ -28,3 +28,6 @@ local.properties
 
 # Test Reports
 /test-output/
+
+# Keep large tflite models out of the repo
+app/src/main/assets/*.tflite
