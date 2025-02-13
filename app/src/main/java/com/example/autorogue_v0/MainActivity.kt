@@ -8,7 +8,9 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.media.AudioAttributes
-import android.media.SoundPool
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -30,6 +32,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonColors
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -56,21 +61,65 @@ import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
+import java.util.Locale
 
 // --- ViewModel to hold inference state ---
 class MainViewModel : ViewModel() {
     var inferenceResult by mutableStateOf("Waiting for input...")
     var confidenceLevel by mutableStateOf(0.0f)
+    var beepEnabled by mutableStateOf(false)
+}
+
+// --- BeepPlayer using AudioTrack
+class BeepPlayer(private val context: Context) {
+    private var audioTrack: AudioTrack? = null
+
+    // Generate and plays a 1000Hz sine tone
+    fun playBeep() {
+        // Stop current beep if it exists
+        stopBeep()
+        val sampleRate = 44100
+        val durationMs = 300
+        val numSamples = (durationMs * sampleRate) / 1000
+        val fadeOutSamples = (0.2 * numSamples).toInt()
+        val samples = ShortArray(numSamples)
+        val freqOfTone = 1000.0
+        for (i in samples.indices) {
+            // Compute the fade out
+            val amplitude = if (i >= numSamples - fadeOutSamples) {
+                (numSamples - i).toDouble() / fadeOutSamples
+            } else {
+                1.0
+            }
+            // Generate a sine wave sample
+            samples[i] = (Short.MAX_VALUE * amplitude * Math.sin(2 * Math.PI * i / (sampleRate / freqOfTone))).toInt().toShort()
+        }
+        // Create static audioTrack instance
+        audioTrack = AudioTrack(
+            AudioManager.STREAM_MUSIC,
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            numSamples * 2,
+            AudioTrack.MODE_STATIC
+        )
+        audioTrack?.write(samples, 0, numSamples)
+        audioTrack?.play()
+    }
+
+    fun stopBeep() {
+        audioTrack?.stop()
+        audioTrack?.release()
+        audioTrack = null
+    }
 }
 
 // --- Main Activity ---
 class MainActivity : ComponentActivity() {
 
-    // Interpreter and SoundPool are initialized on the dedicated inference thread.
+    // Interpreter and BeepPlayer are initialized on the dedicated inference thread.
     private lateinit var tfliteInterpreter: Interpreter
-    private lateinit var soundPool: SoundPool
-    private var beepStreamId: Int = 0
-    private var beepSoundId: Int = 0
+    private lateinit var beepPlayer: BeepPlayer
 
     // Preprocessing components.
     private lateinit var imageProcessor: ImageProcessor
@@ -92,11 +141,6 @@ class MainActivity : ComponentActivity() {
 
     // Flag to signal that the interpreter is initialized.
     private var interpreterReady by mutableStateOf(false)
-
-    // Helper function to update the beepStreamId.
-    fun updateBeepStreamId(streamId: Int) {
-        beepStreamId = streamId
-    }
 
     // Helper: Check GPU delegate availability.
     object GpuDelegateHelper {
@@ -122,15 +166,15 @@ class MainActivity : ComponentActivity() {
         // Initialize the TFLite interpreter on the dedicated inference thread.
         initializeInterpreterOnInferenceThread()
 
+        // Initialize beepPlayer
+        beepPlayer = BeepPlayer(this)
+
         // Create and cache the ImageProcessor for preprocessing.
         imageProcessor = ImageProcessor.Builder()
             .add(ResizeWithCropOrPadOp(224, 298))
             .add(ResizeOp(224, 298, ResizeOp.ResizeMethod.BILINEAR))
             .add(NormalizeOp(0f, 255f))
             .build()
-
-        // Initialize SoundPool to play a beep when confidence is high.
-        initializeSoundPool()
 
         enableEdgeToEdge()
         setContent {
@@ -148,11 +192,9 @@ class MainActivity : ComponentActivity() {
                                 yuvToRgbConverter = yuvToRgbConverter,
                                 tfliteInterpreter = tfliteInterpreter,
                                 imageProcessor = imageProcessor,
-                                soundPool = soundPool,
-                                beepSoundId = beepSoundId,
                                 frameInterval = frameInterval,
                                 inferenceDispatcher = inferenceDispatcher,
-                                onBeepPlayed = { streamId -> updateBeepStreamId(streamId) }
+                                beepPlayer = beepPlayer
                             )
                         } else {
                             // Show a loading indicator if we are still initializing.
@@ -187,11 +229,31 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.padding(16.dp)
                             )
                             Text(
-                                text = String.format("Confidence: %.2f%%", viewModel.confidenceLevel * 100),
+                                text = String.format(Locale.UK, "Confidence: %.2f%%", viewModel.confidenceLevel * 100),
                                 fontSize = 18.sp,
                                 color = Color.White,
                                 modifier = Modifier.padding(16.dp)
                             )
+                        }
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .background(Color(0xAA000000))
+                                .padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Button(
+                                onClick = { viewModel.beepEnabled = !viewModel.beepEnabled },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color.Transparent
+                                )
+                            ) {
+                                Text(
+                                    text = if (viewModel.beepEnabled) "Disable Sound" else "Enable Sound",
+                                    color = Color.White,
+                                    fontSize = 18.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -226,21 +288,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun initializeSoundPool() {
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-
-        soundPool = SoundPool.Builder()
-            .setMaxStreams(1)
-            .setAudioAttributes(audioAttributes)
-            .build()
-
-        // Load the beep sound from res/raw/beep.mp3.
-        beepSoundId = soundPool.load(this, R.raw.beep, 1)
-    }
-
     private fun loadModelFile(modelFilename: String): MappedByteBuffer {
         val fileDescriptor = assets.openFd(modelFilename)
         val fileInputStream = FileInputStream(fileDescriptor.fileDescriptor)
@@ -256,8 +303,8 @@ class MainActivity : ComponentActivity() {
         when {
             ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
                     PackageManager.PERMISSION_GRANTED -> {
-                cameraPermissionGranted = true
-            }
+                        cameraPermissionGranted = true
+                    }
             else -> {
                 requestPermissionLauncher.launch(Manifest.permission.CAMERA)
             }
@@ -278,7 +325,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        soundPool.release()
         inferenceDispatcher.cancel() // Cancel the dispatcher to clean up resources.
         inferenceExecutor.shutdown()
     }
@@ -286,17 +332,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         // Stop any currently playing beep sound.
-        // Stop the beep if one is playing.
-        if (beepStreamId != 0) {
-            soundPool.stop(beepStreamId)
-            beepStreamId = 0
-        }
-        soundPool.autoPause()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        soundPool.autoResume()
+        beepPlayer.stopBeep()
     }
 }
 
@@ -307,11 +343,9 @@ fun CameraPreview(
     yuvToRgbConverter: YuvToRgbConverter,
     tfliteInterpreter: Interpreter,
     imageProcessor: ImageProcessor,
-    soundPool: SoundPool,
-    beepSoundId: Int,
     frameInterval: Long,
     inferenceDispatcher: CoroutineDispatcher,
-    onBeepPlayed: (Int) -> Unit
+    beepPlayer: BeepPlayer
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -369,9 +403,8 @@ fun CameraPreview(
                         tfliteInterpreter.run(processedImage.buffer, output)
                         val confidence = output[0][0]
                         val resultText = if (confidence > 0.5f) "Leaf roll detected" else "No leaf roll detected"
-                        if (confidence > 0.75f) {
-                            val streamId = soundPool.play(beepSoundId, 1f, 1f, 0, 0, 1f)
-                            onBeepPlayed(streamId)
+                        if (confidence > 0.75f && viewModel.beepEnabled) {
+                            beepPlayer.playBeep()
                         }
                         // Update UI on the main thread.
                         withContext(Dispatchers.Main) {
