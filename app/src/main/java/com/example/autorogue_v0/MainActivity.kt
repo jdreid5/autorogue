@@ -1,29 +1,14 @@
 package com.example.autorogue_v0
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioTrack
 import android.os.Bundle
-import android.renderscript.Allocation
-import android.renderscript.Element
-import android.renderscript.RenderScript
-import android.renderscript.ScriptIntrinsicYuvToRGB
-import android.renderscript.Type
-import android.util.Log
-import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Button
@@ -35,19 +20,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModel
 import com.example.autorogue_v0.ui.theme.Autorogue_v0Theme
 import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
-import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
 import java.io.FileInputStream
@@ -55,57 +35,6 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
 import java.util.Locale
-
-// --- ViewModel to hold inference state ---
-class MainViewModel : ViewModel() {
-    var inferenceResult by mutableStateOf("Waiting for input...")
-    var confidenceLevel by mutableStateOf(0.0f)
-    var beepEnabled by mutableStateOf(false)
-}
-
-// --- BeepPlayer using AudioTrack
-class BeepPlayer(private val context: Context) {
-    private var audioTrack: AudioTrack? = null
-
-    // Generate and plays a 1000Hz sine tone
-    fun playBeep() {
-        // Stop current beep if it exists
-        stopBeep()
-        val sampleRate = 44100
-        val durationMs = 300
-        val numSamples = (durationMs * sampleRate) / 1000
-        val fadeOutSamples = (0.2 * numSamples).toInt()
-        val samples = ShortArray(numSamples)
-        val freqOfTone = 1000.0
-        for (i in samples.indices) {
-            // Compute the fade out
-            val amplitude = if (i >= numSamples - fadeOutSamples) {
-                (numSamples - i).toDouble() / fadeOutSamples
-            } else {
-                1.0
-            }
-            // Generate a sine wave sample
-            samples[i] = (Short.MAX_VALUE * amplitude * Math.sin(2 * Math.PI * i / (sampleRate / freqOfTone))).toInt().toShort()
-        }
-        // Create static audioTrack instance
-        audioTrack = AudioTrack(
-            AudioManager.STREAM_MUSIC,
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            numSamples * 2,
-            AudioTrack.MODE_STATIC
-        )
-        audioTrack?.write(samples, 0, numSamples)
-        audioTrack?.play()
-    }
-
-    fun stopBeep() {
-        audioTrack?.stop()
-        audioTrack?.release()
-        audioTrack = null
-    }
-}
 
 // --- Main Activity ---
 class MainActivity : ComponentActivity() {
@@ -326,174 +255,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
         // Stop any currently playing beep sound.
         beepPlayer.stopBeep()
-    }
-}
-
-// --- Composable for Camera Preview and Image Analysis ---
-@Composable
-fun CameraPreview(
-    viewModel: MainViewModel,
-    yuvToRgbConverter: YuvToRgbConverter,
-    tfliteInterpreter: Interpreter,
-    imageProcessor: ImageProcessor,
-    frameInterval: Long,
-    inferenceDispatcher: CoroutineDispatcher,
-    beepPlayer: BeepPlayer
-) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
-    val previewView = remember { PreviewView(context) }
-
-    LaunchedEffect(cameraProviderFuture) {
-        val cameraProvider = cameraProviderFuture.get()
-
-        val preview = Preview.Builder().build().also {
-            it.setSurfaceProvider(previewView.surfaceProvider)
-        }
-
-        // Reduce resolution to ease processing.
-        val imageAnalysis = ImageAnalysis.Builder()
-            .setTargetResolution(Size(640, 480))
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .build()
-
-        imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor(), object : ImageAnalysis.Analyzer {
-            // Reuse a Bitmap buffer for YUV-to-RGB conversion.
-            private var rgbBuffer: Bitmap? = null
-            private var lastFrameTime = 0L
-
-            override fun analyze(imageProxy: ImageProxy) {
-                val currentTime = System.currentTimeMillis()
-                if (currentTime - lastFrameTime < frameInterval) {
-                    imageProxy.close()
-                    return
-                }
-                lastFrameTime = currentTime
-
-                // Ensure the rgbBuffer matches the frame dimensions.
-                if (rgbBuffer == null ||
-                    rgbBuffer?.width != imageProxy.width ||
-                    rgbBuffer?.height != imageProxy.height
-                ) {
-                    rgbBuffer = Bitmap.createBitmap(
-                        imageProxy.width,
-                        imageProxy.height,
-                        Bitmap.Config.ARGB_8888
-                    )
-                }
-
-                // Run inference on the dedicated inferenceDispatcher.
-                CoroutineScope(inferenceDispatcher).launch {
-                    try {
-                        // Convert YUV image to an RGB Bitmap.
-                        yuvToRgbConverter.yuvToRgb(imageProxy, rgbBuffer!!)
-                        // Preprocess the image.
-                        val tensorImage = TensorImage.fromBitmap(rgbBuffer)
-                        val processedImage = imageProcessor.process(tensorImage)
-                        val output = Array(1) { FloatArray(1) }
-                        // Run inference.
-                        tfliteInterpreter.run(processedImage.buffer, output)
-                        val confidence = output[0][0]
-                        val resultText = if (confidence > 0.5f) "Leaf roll detected" else "No leaf roll detected"
-                        if (confidence > 0.75f && viewModel.beepEnabled) {
-                            beepPlayer.playBeep()
-                        }
-                        // Update UI on the main thread.
-                        withContext(Dispatchers.Main) {
-                            viewModel.inferenceResult = resultText
-                            viewModel.confidenceLevel = confidence
-                        }
-                    } catch (e: Exception) {
-                        Log.e("ImageAnalysis", "Error during analysis", e)
-                    } finally {
-                        imageProxy.close()
-                    }
-                }
-            }
-        })
-
-        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-        try {
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
-                lifecycleOwner,
-                cameraSelector,
-                preview,
-                imageAnalysis
-            )
-        } catch (exc: Exception) {
-            Log.e("CameraXApp", "Use case binding failed", exc)
-        }
-    }
-
-    AndroidView(
-        factory = { previewView },
-        modifier = Modifier.fillMaxSize()
-    )
-}
-
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(text = "Hello $name!", modifier = modifier)
-}
-
-@Composable
-fun GreetingPreview() {
-    Autorogue_v0Theme {
-        Greeting("Android")
-    }
-}
-
-// --- YUV to RGB Converter using RenderScript ---
-// (Note: RenderScript is deprecated in newer Android versions; consider alternatives if needed)
-class YuvToRgbConverter(private val context: Context) {
-    private val rs: RenderScript = RenderScript.create(context)
-    private val yuvToRgbIntrinsic: ScriptIntrinsicYuvToRGB =
-        ScriptIntrinsicYuvToRGB.create(rs, Element.U8_4(rs))
-
-    fun yuvToRgb(image: ImageProxy, output: Bitmap) {
-        val nv21 = yuv420888ToNv21(image)
-        val yuvType = Type.Builder(rs, Element.U8(rs)).setX(nv21.size)
-        val inAllocation = Allocation.createTyped(rs, yuvType.create(), Allocation.USAGE_SCRIPT)
-        inAllocation.copyFrom(nv21)
-        yuvToRgbIntrinsic.setInput(inAllocation)
-        val outAllocation = Allocation.createFromBitmap(rs, output)
-        yuvToRgbIntrinsic.forEach(outAllocation)
-        outAllocation.copyTo(output)
-    }
-
-    // Convert ImageProxy in YUV_420_888 format to an NV21 byte array.
-    private fun yuv420888ToNv21(image: ImageProxy): ByteArray {
-        val width = image.width
-        val height = image.height
-        val ySize = width * height
-        val uvSize = width * height / 4
-        val nv21 = ByteArray(ySize + uvSize * 2)
-
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
-
-        val yRowStride = image.planes[0].rowStride
-        val uvRowStride = image.planes[1].rowStride
-
-        var pos = 0
-        // Copy Y plane.
-        for (row in 0 until height) {
-            yBuffer.position(row * yRowStride)
-            yBuffer.get(nv21, pos, width)
-            pos += width
-        }
-        // Interleave V and U (NV21 expects V then U).
-        for (row in 0 until height / 2) {
-            uBuffer.position(row * uvRowStride)
-            vBuffer.position(row * uvRowStride)
-            for (col in 0 until width / 2) {
-                nv21[pos++] = vBuffer.get()
-                nv21[pos++] = uBuffer.get()
-            }
-        }
-        return nv21
     }
 }
